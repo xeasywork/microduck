@@ -25,11 +25,13 @@ test is what keeps the three lists honest until then.
 
 Copied from `apirrone/microduck_runtime` at commit `5f3b314` (`roulade.onnx` at `7e4ab6d`,
 where it first appeared), dereferencing the symlinks that repository uses to give stable
-names to specific training runs:
+names to specific training runs. The walking role is the exception: it intentionally uses
+the flat-ground policy from `567fdcd`. Unlike the later rough-terrain policy, it responds to
+reverse, lateral, and yaw commands in MuJoCo as well as forward commands.
 
 | here | there | role |
 | --- | --- | --- |
-| `alpha_walking.onnx` | `BEST_alpha_walking_rough.onnx` | walking / velstand |
+| `alpha_walking.onnx` | `BEST_alpha_walking_flat.onnx` | omnidirectional walking / velstand |
 | `alpha_stand.onnx` | `BEST_alpha_stand_body_control.onnx` | standing + body-pose |
 | `alpha_sitstand.onnx` | `BEST_alpha_sitstand.onnx` | sit ↔ stand (posture flag) |
 | `alpha_ground_pick.onnx` | `alpha_ground_pick.onnx` | ground pick (phase command) |
