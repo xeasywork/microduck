@@ -2985,6 +2985,15 @@ fn dispatch(
 
         proto::Call::RobotSubscribe(_) => {
             let policies = state.policies.load();
+            let policy_error = state.policy_error.load_full();
+            let available_behaviors = if policy_error.is_none() {
+                policies.available_behaviors(state.has_voice)
+            } else {
+                // Keep only capabilities that do not depend on a loaded ONNX controller.
+                // Reporting a configured file as executable after its load failed makes
+                // clients render controls that robot.do will inevitably refuse.
+                PolicyNames::default().available_behaviors(state.has_voice)
+            };
             proto::Response::ok(
                 Some(id),
                 &proto::SubscribeResult {
@@ -2997,8 +3006,8 @@ fn dispatch(
                     kick_right: policies.kick_right.clone(),
                     roulade: policies.roulade.clone(),
                     runtime: Some("hardware".to_owned()),
-                    available_behaviors: policies.available_behaviors(state.has_voice),
-                    unavailable: state.policy_error.load_full().map_or_else(
+                    available_behaviors,
+                    unavailable: policy_error.map_or_else(
                         || {
                             policies.walk.is_none().then(|| {
                                 "no policy configured; holding the startup pose".to_owned()
@@ -3879,6 +3888,18 @@ mod tests {
                 .is_some_and(|u| u.contains("ONNX Runtime not loadable")),
             "{:?}",
             result.unavailable
+        );
+        assert!(result.available_behaviors.iter().any(|id| id == "stop"));
+        assert!(
+            !result.available_behaviors.iter().any(|id| id == "move"),
+            "a failed controller must not advertise policy-backed behavior"
+        );
+        assert!(
+            !result
+                .available_behaviors
+                .iter()
+                .any(|id| id == "head_tilt"),
+            "deterministic expressions still require the standing policy"
         );
     }
 
