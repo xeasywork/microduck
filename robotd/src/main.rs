@@ -20,6 +20,7 @@
 
 mod chorale;
 mod control;
+mod expression;
 mod intents;
 mod params;
 mod soc;
@@ -45,6 +46,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use control::{Controller, SkillTuning, Tuning};
+use expression::PetExpression;
 use intents::Intents;
 use params::{Mode, Params};
 
@@ -329,6 +331,32 @@ impl PolicyNames {
             kick_right: name(&policy.kick_right),
             roulade: name(&policy.roulade),
         }
+    }
+
+    fn available_behaviors(&self, has_voice: bool) -> Vec<String> {
+        let mut values = vec!["stop".to_owned(), "enable".to_owned()];
+        if self.walk.is_some() {
+            values.extend(
+                ["move", "head_tilt", "curious_scan", "greet", "invite_play"]
+                    .into_iter()
+                    .map(str::to_owned),
+            );
+        }
+        for (id, available) in [
+            ("sit_toggle", self.sitstand.is_some()),
+            ("ground_pick", self.ground_pick.is_some()),
+            ("kick_left", self.kick_left.is_some()),
+            ("kick_right", self.kick_right.is_some()),
+            ("roulade", self.roulade.is_some()),
+        ] {
+            if available {
+                values.push(id.to_owned());
+            }
+        }
+        if has_voice {
+            values.push("quack".to_owned());
+        }
+        values
     }
 }
 
@@ -1169,6 +1197,7 @@ async fn control_loop<T: RobotIo>(
 
     // Loaded once here and again on a mode switch — see `build_controller`.
     let mut controller = build_controller(&policy_cfg, params.safety.limp_fall, &state);
+    let mut pet_expression: Option<PetExpression> = None;
 
     tracing::warn!(
         joints = NUM_JOINTS,
@@ -1444,8 +1473,15 @@ async fn control_loop<T: RobotIo>(
 
         // One-shot skill requests, taken once per tick like the power request. They need a
         // driving robot — the prototype's buttons likewise did nothing until the policy ran.
+        let cancel_behaviors = intents.take_behavior_cancel();
+        if cancel_behaviors {
+            if let Some(controller) = controller.as_mut() {
+                controller.cancel_motion();
+            }
+            pet_expression = None;
+        }
         let requests = intents.take_skills();
-        if requests.any() {
+        if requests.any() && !cancel_behaviors {
             match controller.as_mut() {
                 Some(controller)
                     if snapshot.enabled && bringup == Bringup::Ready && shutdown_sit.is_none() =>
@@ -1478,6 +1514,25 @@ async fn control_loop<T: RobotIo>(
                             Err(reason) => {
                                 tracing::debug!(skill = "roulade", reason, "skill refused");
                             }
+                        }
+                    }
+                    let expression_skill = [
+                        (requests.head_tilt, proto::Skill::HeadTilt),
+                        (requests.curious_scan, proto::Skill::CuriousScan),
+                        (requests.greet, proto::Skill::Greet),
+                        (requests.invite_play, proto::Skill::InvitePlay),
+                    ]
+                    .into_iter()
+                    .find_map(|(requested, skill)| requested.then_some(skill));
+                    if let Some(skill) = expression_skill {
+                        if controller.busy() {
+                            tracing::info!("pet expression ignored: a policy skill is running");
+                        } else if let Some((expression, sound)) = PetExpression::start(skill) {
+                            pet_expression = Some(expression);
+                            if let (Some(voice), Some(sound)) = (voice.as_mut(), sound) {
+                                voice.play(sound.as_str(), false);
+                            }
+                            tracing::warn!(skill = ?skill, "pet expression started");
                         }
                     }
                 }
@@ -1763,22 +1818,48 @@ async fn control_loop<T: RobotIo>(
         } else {
             body_ema = [0.0; 3];
         }
+        // A non-zero driver command takes the robot back immediately. The expression
+        // trajectory itself is smooth, so dropping it here hands over without a stale
+        // autonomous target fighting the owner.
+        if gated.twist.iter().any(|value| value.abs() > f64::EPSILON) {
+            pet_expression = None;
+        }
+        let expression_frame = pet_expression.as_mut().and_then(|item| item.tick(dt));
+        if pet_expression.is_some() && expression_frame.is_none() {
+            pet_expression = None;
+        }
         let command = PolicyCommand {
-            twist: twist_ema,
+            twist: if expression_frame.is_some() {
+                [0.0; 3]
+            } else {
+                twist_ema
+            },
             // The chorale's sway rides on top of whatever the head was asked to do, computed
             // last tick (20 ms stale, invisible at sway speed) and slewed to zero when the
             // singing stops so the head settles rather than snaps.
-            head: [
-                head_ema[0] + chorale_head[0],
-                head_ema[1] + chorale_head[1],
-                head_ema[2] + chorale_head[2],
-                head_ema[3] + chorale_head[3],
-            ],
-            body: BodyPose {
-                z: body_ema[0],
-                roll: body_ema[1],
-                pitch: body_ema[2],
-            },
+            head: expression_frame.map_or_else(
+                || {
+                    [
+                        head_ema[0] + chorale_head[0],
+                        head_ema[1] + chorale_head[1],
+                        head_ema[2] + chorale_head[2],
+                        head_ema[3] + chorale_head[3],
+                    ]
+                },
+                |frame| frame.head,
+            ),
+            body: expression_frame.map_or(
+                BodyPose {
+                    z: body_ema[0],
+                    roll: body_ema[1],
+                    pitch: body_ema[2],
+                },
+                |frame| BodyPose {
+                    z: frame.body[0],
+                    roll: frame.body[1],
+                    pitch: frame.body[2],
+                },
+            ),
         };
 
         // Bring the robot up when someone asks it to drive and it has no torque yet.
@@ -1968,13 +2049,19 @@ async fn control_loop<T: RobotIo>(
             },
             (true, Some(sensors)) => {
                 let controller = controller.as_mut().expect("driving implies a controller");
-                match controller.step(sensors, &command, snapshot.pose.active, dt, scale_mult) {
+                match controller.step(
+                    sensors,
+                    &command,
+                    snapshot.pose.active || expression_frame.is_some(),
+                    dt,
+                    scale_mult,
+                ) {
                     Ok(step) => (
                         step.targets,
                         step.gain,
                         // A scripted move is motion whatever the twist says; so is walking.
-                        step.busy || command.twist_magnitude() > 0.0,
-                        step.label,
+                        step.busy || expression_frame.is_some() || command.twist_magnitude() > 0.0,
+                        expression_frame.map_or(step.label, |frame| frame.label),
                     ),
                     Err(e) => {
                         tracing::warn!(error = %e, "inference failed; holding");
@@ -2718,15 +2805,20 @@ fn dispatch(
         // the prototype's buttons did.
         proto::Call::RobotDo(p) => {
             let policies = state.policies.load();
-            let configured = match p.skill {
-                // One load for the whole decision: these are the *current* mode's networks, and
-                // reading them field by field could straddle a mode switch.
-                proto::Skill::GroundPick => policies.ground_pick.is_some(),
-                proto::Skill::KickLeft => policies.kick_left.is_some(),
-                proto::Skill::KickRight => policies.kick_right.is_some(),
-                proto::Skill::SitToggle => policies.sitstand.is_some(),
-                proto::Skill::Roulade => policies.roulade.is_some(),
-            };
+            let configured = state.policy_error.load().is_none()
+                && match p.skill {
+                    // One load for the whole decision: these are the *current* mode's networks, and
+                    // reading them field by field could straddle a mode switch.
+                    proto::Skill::GroundPick => policies.ground_pick.is_some(),
+                    proto::Skill::KickLeft => policies.kick_left.is_some(),
+                    proto::Skill::KickRight => policies.kick_right.is_some(),
+                    proto::Skill::SitToggle => policies.sitstand.is_some(),
+                    proto::Skill::Roulade => policies.roulade.is_some(),
+                    proto::Skill::HeadTilt
+                    | proto::Skill::CuriousScan
+                    | proto::Skill::Greet
+                    | proto::Skill::InvitePlay => policies.walk.is_some(),
+                };
             // Not refused for being down. A skill on a fallen robot is the human's call,
             // and refusing it is how a robot ends up unable to do the thing that would
             // have righted it.
@@ -2904,6 +2996,8 @@ fn dispatch(
                     kick_left: policies.kick_left.clone(),
                     kick_right: policies.kick_right.clone(),
                     roulade: policies.roulade.clone(),
+                    runtime: Some("hardware".to_owned()),
+                    available_behaviors: policies.available_behaviors(state.has_voice),
                     unavailable: state.policy_error.load_full().map_or_else(
                         || {
                             policies.walk.is_none().then(|| {
@@ -3620,6 +3714,19 @@ mod tests {
         .unwrap();
         assert!(down.accepted, "fallen must not refuse a skill");
         assert!(intents.take_skills().sit_toggle);
+
+        let expression: proto::IntentResult = dispatch(
+            &s,
+            &intents,
+            id(),
+            &proto::Call::RobotDo(proto::DoParams {
+                skill: proto::Skill::HeadTilt,
+            }),
+        )
+        .result_as()
+        .unwrap();
+        assert!(expression.accepted);
+        assert!(intents.take_skills().head_tilt);
     }
 
     /// The pose and mouth intents land in their slots like move and head do — including via
@@ -3714,6 +3821,14 @@ mod tests {
         assert_eq!(result.walk.as_deref(), Some("alpha_walking.onnx"));
         assert_eq!(result.stand.as_deref(), Some("alpha_stand.onnx"));
         assert_eq!(result.unavailable, None);
+        assert_eq!(result.runtime.as_deref(), Some("hardware"));
+        assert!(result.available_behaviors.iter().any(|id| id == "move"));
+        assert!(
+            result
+                .available_behaviors
+                .iter()
+                .any(|id| id == "head_tilt")
+        );
     }
 
     /// A policy that was wanted and would not load is a different situation from one that was

@@ -209,6 +209,19 @@ impl Controller {
             || matches!(self.sit, Sit::Rising { .. })
     }
 
+    /// Interrupt every transient policy skill. A seated posture is deliberately kept:
+    /// stopping a resting duck must not unexpectedly make it stand, while a later
+    /// `robot.enable(false)` still returns the whole robot to its home pose.
+    pub fn cancel_motion(&mut self) {
+        self.ground_pick = None;
+        self.kick = None;
+        self.roulade = None;
+        self.roulade_chain = 0.0;
+        if matches!(self.sit, Sit::Rising { .. }) {
+            self.sit = Sit::Up;
+        }
+    }
+
     /// Start a one-shot ground pick. The prototype gates the trigger on nothing but the
     /// network existing and the move not already running — a pick can even preempt a kick's
     /// tail, and that stays as it was.

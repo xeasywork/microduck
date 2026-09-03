@@ -80,11 +80,23 @@ pub struct SkillRequests {
     /// Start a roll — or, arriving while one runs, chain another. Clients hold a button
     /// down by sending this every tick, so unlike the others it is a *level* in practice.
     pub roulade: bool,
+    pub head_tilt: bool,
+    pub curious_scan: bool,
+    pub greet: bool,
+    pub invite_play: bool,
 }
 
 impl SkillRequests {
     pub fn any(&self) -> bool {
-        self.ground_pick || self.kick_left || self.kick_right || self.sit_toggle || self.roulade
+        self.ground_pick
+            || self.kick_left
+            || self.kick_right
+            || self.sit_toggle
+            || self.roulade
+            || self.head_tilt
+            || self.curious_scan
+            || self.greet
+            || self.invite_play
     }
 }
 
@@ -94,6 +106,10 @@ const SKILL_KICK_LEFT: u32 = 1 << 1;
 const SKILL_KICK_RIGHT: u32 = 1 << 2;
 const SKILL_SIT_TOGGLE: u32 = 1 << 3;
 const SKILL_ROULADE: u32 = 1 << 4;
+const SKILL_HEAD_TILT: u32 = 1 << 5;
+const SKILL_CURIOUS_SCAN: u32 = 1 << 6;
+const SKILL_GREET: u32 = 1 << 7;
+const SKILL_INVITE_PLAY: u32 = 1 << 8;
 
 /// How fresh a wheee hold must be to still count as held. `padd` re-notifies every tick
 /// (20 ms) while the trigger is down, so anything much older means the client stopped
@@ -154,6 +170,9 @@ pub struct Intents {
     /// Pending skill requests, a bitmask taken (swapped to zero) once per tick. A mask
     /// rather than one slot so two different buttons in the same tick both arrive.
     skills: std::sync::atomic::AtomicU32,
+    /// An urgent stop/disable invalidates both queued and active behavior. Taken by the
+    /// loop before skill requests, so a request racing a stop cannot restart motion.
+    cancel_behaviors: AtomicBool,
     /// A shutdown was requested. A level, not an edge: once asked, the sequence runs.
     shutdown: AtomicBool,
     /// A drive-mode switch was requested, and which mode to switch to.
@@ -225,6 +244,7 @@ impl Intents {
             chorale_piece: AtomicU8::new(0),
             chorale_heard: std::sync::Mutex::new(Vec::new()),
             skills: std::sync::atomic::AtomicU32::new(0),
+            cancel_behaviors: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             mode_switch: AtomicU8::new(MODE_NONE),
             sounds: std::sync::atomic::AtomicU32::new(0),
@@ -256,6 +276,7 @@ impl Intents {
     /// Zero the velocity now. Distinct from the deadman only in that it is deliberate.
     pub fn stop(&self) {
         self.set_twist([0.0; 3]);
+        self.cancel_behaviors.store(true, Ordering::Relaxed);
     }
 
     pub fn set_pose(&self, pose: PoseIntent) {
@@ -275,6 +296,10 @@ impl Intents {
             duck_ipc_proto::Skill::KickRight => SKILL_KICK_RIGHT,
             duck_ipc_proto::Skill::SitToggle => SKILL_SIT_TOGGLE,
             duck_ipc_proto::Skill::Roulade => SKILL_ROULADE,
+            duck_ipc_proto::Skill::HeadTilt => SKILL_HEAD_TILT,
+            duck_ipc_proto::Skill::CuriousScan => SKILL_CURIOUS_SCAN,
+            duck_ipc_proto::Skill::Greet => SKILL_GREET,
+            duck_ipc_proto::Skill::InvitePlay => SKILL_INVITE_PLAY,
         };
         self.skills
             .fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
@@ -289,7 +314,16 @@ impl Intents {
             kick_right: bits & SKILL_KICK_RIGHT != 0,
             sit_toggle: bits & SKILL_SIT_TOGGLE != 0,
             roulade: bits & SKILL_ROULADE != 0,
+            head_tilt: bits & SKILL_HEAD_TILT != 0,
+            curious_scan: bits & SKILL_CURIOUS_SCAN != 0,
+            greet: bits & SKILL_GREET != 0,
+            invite_play: bits & SKILL_INVITE_PLAY != 0,
         }
+    }
+
+    /// Consume the urgent behavior-cancel edge.
+    pub fn take_behavior_cancel(&self) -> bool {
+        self.cancel_behaviors.swap(false, Ordering::Relaxed)
     }
 
     /// Queue a sound for the loop's next tick. The wheee is the exception — it is a level,
@@ -369,6 +403,9 @@ impl Intents {
 
     pub fn set_enabled(&self, on: bool) {
         self.enabled.store(on, Ordering::Relaxed);
+        if !on {
+            self.cancel_behaviors.store(true, Ordering::Relaxed);
+        }
     }
 
     /// The current enable state — what `robot.enable`'s `toggle` flips. The loop reads its
@@ -388,6 +425,7 @@ impl Intents {
     /// keep driving, and leaving that flag set would have the next tick bring it straight back up.
     pub fn request_relax(&self) {
         self.enabled.store(false, Ordering::Relaxed);
+        self.cancel_behaviors.store(true, Ordering::Relaxed);
         self.power.store(POWER_RELAX, Ordering::Relaxed);
     }
 
@@ -589,6 +627,24 @@ mod tests {
         let snap = intents.snapshot();
         assert_eq!(snap.command.twist, [0.0; 3]);
         assert!(snap.enabled, "stop is not disable");
+        assert!(
+            intents.take_behavior_cancel(),
+            "stop must also interrupt a transient behavior"
+        );
+        assert!(
+            !intents.take_behavior_cancel(),
+            "the cancellation is one edge, not a permanent gate"
+        );
+    }
+
+    #[test]
+    fn disabling_cancels_queued_pet_expressions() {
+        let intents = Intents::new();
+        intents.request_skill(duck_ipc_proto::Skill::HeadTilt);
+        intents.set_enabled(false);
+
+        assert!(intents.take_behavior_cancel());
+        assert!(intents.take_skills().head_tilt);
     }
 
     /// The body block has no intent behind it yet and must stay at the trained nominal.
